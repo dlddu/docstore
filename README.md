@@ -108,8 +108,10 @@ runs `test.yml` against that exact image:
 - `e2e (kind)` — deploys `deploy/overlays/e2e` with the published image and runs
   `scripts/smoke.sh` over HTTP, including a pod restart on a persistent volume
 
-Tests do not run again on `main`. A push to `main` publishes
-`ghcr.io/dlddu/docstore:<sha>` and force-pushes the `deploy` branch: that commit
+Tests do not run again on `main`. A push to `main` that touches the image
+(`Dockerfile`, `Cargo.*`, `src/`) or the production manifests (`deploy/base`,
+`deploy/overlays/prod`) publishes `ghcr.io/dlddu/docstore:<sha>` and
+force-pushes the `deploy` branch: that commit
 plus one commit pinning the image in `deploy/` to `<sha>` (trailer
 `Source-Commit: <sha>`). Production follows `deploy`: Flux in
 [dlddu/flux-cd-apps](https://github.com/dlddu/flux-cd-apps) applies
@@ -120,5 +122,7 @@ in that repo under `apps/docstore`.
 - Image tags are commit SHAs only; there is no `latest`. The `image:` line on
   `main` is a placeholder and does not affect production.
 - Roll back by merging a revert PR into `main`; that publishes and pins a new SHA.
-- To see what production runs, read the `Source-Commit` trailer of the tip of
-  `deploy`.
+- Merges that only change docs, tests, scripts, the e2e overlay or other
+  workflows are skipped (`paths` in `image.yml`), so they do not restart the
+  pod and `deploy` may lag `main`. To see what production runs, read the
+  `Source-Commit` trailer of the tip of `deploy`.

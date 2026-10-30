@@ -13,13 +13,28 @@
 #     아래 event/ref 조건은 어느 쪽이든 같게 동작한다.
 #   - workflow_dispatch: 단독 재실행용.
 #
-# 경로 필터를 두지 않는 것은 의도적이다: main 의 모든 커밋이 자기 SHA 이미지를 가져야 pin 이
-# 그 커밋으로 고정할 수 있다. 소스가 그대로면 buildx gha 캐시가 통째로 히트해 비용이 작다.
+# 경로 필터(main push 에만): 이미지(Dockerfile·Cargo.*·src/·.dockerignore)와 운영 매니페스트
+# (deploy/base·deploy/overlays/prod)에 닿지 않는 머지는 이 워크플로를 돌리지 않는다 — 그렇지
+# 않으면 문서만 바뀐 머지도 새 SHA 태그 → deploy pin → 파드 재시작(Recreate 라 잠깐 끊김)이 된다.
+# 제외 목록 방식이라 새 디렉터리는 기본으로 포함된다. 건너뛴 커밋은 deploy 에 반영되지 않으므로
+# 운영 커밋은 deploy 끝 커밋의 Source-Commit 트레일러가 정본이다.
+# PR(workflow_call)에는 필터가 없다 — 모든 PR 이 head SHA 이미지를 발행하고 그것으로 테스트한다.
 name: Image
 
 on:
   push:
     branches: [main]
+    # 순서가 의미를 갖는다: 마지막으로 매칭된 패턴이 이긴다.
+    paths:
+      - '**'
+      - '.dockerignore'
+      - '!README.md'
+      - '!.gitignore'
+      - '!tests/**'
+      - '!scripts/**'
+      - '!deploy/overlays/e2e/**'
+      - '!.github/**'
+      - '.github/workflows/image.yml'
   workflow_call:
   workflow_dispatch:
 
