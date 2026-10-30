@@ -1,0 +1,12 @@
+# kind 전용. storageClassName 을 비워 kind 기본 클래스(local-path, RWO)를 쓴다.
+# local-path 디렉터리는 0777 로 만들어져 비루트(65532) 이미지도 쓸 수 있다.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: docstore-e2e-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
