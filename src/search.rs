@@ -1,5 +1,14 @@
 //! `simple_query_string` parsing and BM25 scoring.
 //!
+//! Scoring follows what OpenSearch does for `simple_query_string` over all
+//! fields (`default_field: *`, `most_fields`): each query term is scored per
+//! field with that field's own statistics (document count, average length,
+//! document frequency) and the per-field scores are added. So a match in a
+//! short, rare field such as a title or a tag weighs more than the same word
+//! buried in a long body. Exact-value fields (`<path>.keyword`, numbers,
+//! booleans) match a query term equal to a whole value, without length
+//! normalization. BM25 is Lucene's (k1 = 1.2, b = 0.75, no `k1 + 1` factor).
+//!
 //! Supported syntax (a pragmatic subset of OpenSearch's):
 //! - bare words are OR-ed together (the default operator);
 //! - `+word` must match, `-word` must not match;
@@ -11,7 +20,9 @@
 //! nothing unless something else does: a negation never turns into "match
 //! everything else".
 
-use crate::analysis::{tokenize, AnalyzedDoc};
+use std::collections::HashMap;
+
+use crate::analysis::{tokenize, AnalyzedDoc, ExactField, TextField};
 
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
@@ -40,6 +51,11 @@ pub struct Clause {
     /// Alternatives: a word like `foo-bar` analyzes into several terms, any
     /// of which may satisfy the clause.
     pub any_of: Vec<Matcher>,
+    /// The clause text before analysis (operator, `*` and `~N` stripped),
+    /// matched against exact-value fields, which are not analyzed.
+    pub raw: String,
+    /// `word*`: also a prefix query on exact-value fields.
+    pub prefix: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,24 +93,25 @@ impl RawClause {
     fn into_clause(self) -> Option<Clause> {
         if self.phrase {
             let terms = tokenize(&self.text);
-            return match terms.len() {
-                0 => None,
-                1 => Some(Clause {
-                    occur: self.occur,
-                    any_of: vec![Matcher::Term {
-                        term: terms.into_iter().next().unwrap(),
-                        prefix: false,
-                    }],
-                }),
-                _ => Some(Clause {
-                    occur: self.occur,
-                    any_of: vec![Matcher::Phrase(terms)],
-                }),
+            let any_of = match terms.len() {
+                0 => return None,
+                1 => vec![Matcher::Term {
+                    term: terms.into_iter().next().unwrap(),
+                    prefix: false,
+                }],
+                _ => vec![Matcher::Phrase(terms)],
             };
+            return Some(Clause {
+                occur: self.occur,
+                any_of,
+                raw: self.text,
+                prefix: false,
+            });
         }
         let text = strip_fuzziness(&self.text);
         let prefix = text.ends_with('*');
-        let terms = tokenize(text.trim_end_matches('*'));
+        let raw = text.trim_end_matches('*').to_owned();
+        let terms = tokenize(&raw);
         if terms.is_empty() {
             return None;
         }
@@ -110,6 +127,8 @@ impl RawClause {
         Some(Clause {
             occur: self.occur,
             any_of,
+            raw,
+            prefix,
         })
     }
 }
@@ -182,100 +201,201 @@ fn lex(input: &str) -> Vec<RawClause> {
     out
 }
 
-/// Collection-level statistics for BM25, computed over the searched docs.
+/// Per-field collection statistics for BM25 over the searched documents.
+#[derive(Default)]
+struct FieldStats {
+    /// Documents that have this field.
+    docs: usize,
+    /// Sum of the field's length over those documents (text fields only).
+    total_len: usize,
+}
+
+impl FieldStats {
+    fn avg_len(&self) -> f64 {
+        if self.docs == 0 {
+            1.0
+        } else {
+            (self.total_len as f64 / self.docs as f64).max(1.0)
+        }
+    }
+}
+
+/// Lucene's BM25 idf: `ln(1 + (N - df + 0.5) / (df + 0.5))`, N being the
+/// documents that have the field.
+fn idf(docs_with_field: usize, df: usize) -> f64 {
+    let (n, df) = (docs_with_field as f64, df as f64);
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
 pub struct Corpus<'a> {
     docs: Vec<&'a AnalyzedDoc>,
-    avg_len: f64,
+    text_stats: HashMap<&'a str, FieldStats>,
+    exact_stats: HashMap<&'a str, FieldStats>,
 }
 
 impl<'a> Corpus<'a> {
     pub fn new(docs: Vec<&'a AnalyzedDoc>) -> Self {
-        let total: usize = docs.iter().map(|d| d.length).sum();
-        let avg_len = if docs.is_empty() {
-            1.0
-        } else {
-            (total as f64 / docs.len() as f64).max(1.0)
-        };
-        Corpus { docs, avg_len }
-    }
-
-    fn idf(&self, matcher: &Matcher) -> f64 {
-        let n = self.docs.len() as f64;
-        let df = self
-            .docs
-            .iter()
-            .filter(|d| frequency(d, matcher) > 0.0)
-            .count() as f64;
-        ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
+        let mut text_stats: HashMap<&str, FieldStats> = HashMap::new();
+        let mut exact_stats: HashMap<&str, FieldStats> = HashMap::new();
+        for doc in &docs {
+            for f in &doc.text {
+                let st = text_stats.entry(f.path.as_str()).or_default();
+                st.docs += 1;
+                st.total_len += f.len;
+            }
+            for f in &doc.exact {
+                exact_stats.entry(f.path.as_str()).or_default().docs += 1;
+            }
+        }
+        Corpus {
+            docs,
+            text_stats,
+            exact_stats,
+        }
     }
 
     /// Scores every document of the corpus, returning `(position, score)` for
     /// the matching ones in corpus order.
     pub fn score_all(&self, query: &Query) -> Vec<(usize, f64)> {
-        match query {
-            Query::MatchNone => Vec::new(),
-            Query::MatchAll => (0..self.docs.len()).map(|i| (i, 1.0)).collect(),
-            Query::Clauses(clauses) => {
-                let idfs: Vec<Vec<f64>> = clauses
+        let clauses = match query {
+            Query::MatchNone => return Vec::new(),
+            Query::MatchAll => return (0..self.docs.len()).map(|i| (i, 1.0)).collect(),
+            Query::Clauses(clauses) => clauses,
+        };
+
+        let mut total = vec![0.0; self.docs.len()];
+        let mut alive = vec![true; self.docs.len()];
+        let mut matched_positive = vec![false; self.docs.len()];
+
+        for clause in clauses {
+            let scores = self.clause_scores(clause);
+            for (i, &sc) in scores.iter().enumerate() {
+                let hit = sc > 0.0;
+                match clause.occur {
+                    Occur::MustNot if hit => alive[i] = false,
+                    Occur::MustNot => {}
+                    Occur::Must if !hit => alive[i] = false,
+                    _ if hit => {
+                        matched_positive[i] = true;
+                        total[i] += sc;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        (0..self.docs.len())
+            .filter(|&i| alive[i] && matched_positive[i])
+            .map(|i| (i, total[i]))
+            .collect()
+    }
+
+    /// One clause's score in every document: the sum over its matchers and
+    /// over every field they hit (`most_fields`).
+    fn clause_scores(&self, clause: &Clause) -> Vec<f64> {
+        let mut scores = vec![0.0; self.docs.len()];
+        for matcher in &clause.any_of {
+            self.add_text_scores(matcher, &mut scores);
+        }
+        self.add_exact_scores(clause, &mut scores);
+        scores
+    }
+
+    fn add_text_scores(&self, matcher: &Matcher, scores: &mut [f64]) {
+        // tf of this matcher per (doc, field), then df per field.
+        let tfs: Vec<Vec<(&TextField, f64)>> = self
+            .docs
+            .iter()
+            .map(|doc| {
+                doc.text
                     .iter()
-                    .map(|c| c.any_of.iter().map(|m| self.idf(m)).collect())
-                    .collect();
-                self.docs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, doc)| {
-                        self.score_doc(doc, clauses, &idfs).map(|score| (i, score))
-                    })
+                    .map(|f| (f, text_frequency(f, matcher)))
+                    .filter(|(_, tf)| *tf > 0.0)
                     .collect()
+            })
+            .collect();
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        for fields in &tfs {
+            for (f, _) in fields {
+                *df.entry(f.path.as_str()).or_default() += 1;
+            }
+        }
+        for (i, fields) in tfs.iter().enumerate() {
+            for (f, tf) in fields {
+                let st = &self.text_stats[f.path.as_str()];
+                let norm = K1 * (1.0 - B + B * f.len as f64 / st.avg_len());
+                scores[i] += idf(st.docs, df[f.path.as_str()]) * tf / (tf + norm);
             }
         }
     }
 
-    fn score_doc(&self, doc: &AnalyzedDoc, clauses: &[Clause], idfs: &[Vec<f64>]) -> Option<f64> {
-        let norm = K1 * (1.0 - B + B * doc.length as f64 / self.avg_len);
-        let mut score = 0.0;
-        let mut matched_positive = false;
-
-        for (clause, clause_idfs) in clauses.iter().zip(idfs) {
-            let mut clause_score = 0.0;
-            for (matcher, idf) in clause.any_of.iter().zip(clause_idfs) {
-                let tf = frequency(doc, matcher);
-                if tf > 0.0 {
-                    clause_score += idf * tf * (K1 + 1.0) / (tf + norm);
-                }
-            }
-            let hit = clause_score > 0.0;
-            match clause.occur {
-                Occur::MustNot if hit => return None,
-                Occur::MustNot => {}
-                Occur::Must if !hit => return None,
-                _ => {
-                    if hit {
-                        matched_positive = true;
-                        score += clause_score;
-                    }
-                }
+    fn add_exact_scores(&self, clause: &Clause, scores: &mut [f64]) {
+        let tfs: Vec<Vec<(&ExactField, f64)>> = self
+            .docs
+            .iter()
+            .map(|doc| {
+                doc.exact
+                    .iter()
+                    .map(|f| (f, exact_frequency(f, &clause.raw, clause.prefix)))
+                    .filter(|(_, tf)| *tf > 0.0)
+                    .collect()
+            })
+            .collect();
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        for fields in &tfs {
+            for (f, _) in fields {
+                *df.entry(f.path.as_str()).or_default() += 1;
             }
         }
-        matched_positive.then_some(score)
+        for (i, fields) in tfs.iter().enumerate() {
+            for (f, tf) in fields {
+                let st = &self.exact_stats[f.path.as_str()];
+                // Exact-value fields carry no length norms.
+                scores[i] += idf(st.docs, df[f.path.as_str()]) * tf / (tf + K1);
+            }
+        }
     }
 }
 
-/// Weighted term frequency of `matcher` in `doc`.
-fn frequency(doc: &AnalyzedDoc, matcher: &Matcher) -> f64 {
+/// Weighted term frequency of `matcher` in one text field.
+fn text_frequency(field: &TextField, matcher: &Matcher) -> f64 {
     match matcher {
-        Matcher::Term { term, prefix } => doc.terms().map(|t| term_weight(t, term, *prefix)).sum(),
-        Matcher::Phrase(terms) => doc
-            .fields
+        Matcher::Term { term, prefix } => field
+            .values
             .iter()
-            .map(|field| {
-                field
+            .flatten()
+            .map(|t| term_weight(t, term, *prefix))
+            .sum(),
+        Matcher::Phrase(terms) => field
+            .values
+            .iter()
+            .map(|value| {
+                value
                     .windows(terms.len())
                     .filter(|w| w.iter().zip(terms).all(|(a, b)| a == b))
                     .count()
             })
             .sum::<usize>() as f64,
     }
+}
+
+/// How many values of an exact-value field the raw clause text equals (or,
+/// for `word*`, prefixes). Case-sensitive, like a `keyword` field.
+fn exact_frequency(field: &ExactField, raw: &str, prefix: bool) -> f64 {
+    if raw.is_empty() {
+        return 0.0;
+    }
+    field
+        .values
+        .iter()
+        .filter(|v| {
+            if prefix {
+                v.starts_with(raw)
+            } else {
+                v.as_str() == raw
+            }
+        })
+        .count() as f64
 }
 
 fn term_weight(doc_term: &str, query_term: &str, explicit_prefix: bool) -> f64 {
@@ -399,5 +519,73 @@ mod tests {
         // "efs" appears twice in doc 1 and nowhere else; "sablier" in 2 docs.
         assert_eq!(matches("efs sablier")[0], 1);
         assert_eq!(matches("*").len(), 4);
+    }
+
+    fn rank(docs: &[serde_json::Value], query: &str) -> Vec<usize> {
+        let analyzed: Vec<AnalyzedDoc> = docs.iter().map(AnalyzedDoc::from_source).collect();
+        let corpus = Corpus::new(analyzed.iter().collect());
+        let mut hits = corpus.score_all(&Query::parse(query));
+        hits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        hits.into_iter().map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn short_field_match_outranks_long_body_match() {
+        let filler = "lorem ipsum dolor sit amet ".repeat(40);
+        let docs = [
+            json!({"title": "notes on storage", "content": format!("{filler} sablier {filler}")}),
+            json!({"title": "sablier setup", "content": filler.clone()}),
+            json!({"title": "other", "content": filler}),
+        ];
+        assert_eq!(rank(&docs, "sablier"), vec![1, 0]);
+    }
+
+    #[test]
+    fn whole_value_keyword_match_adds_weight() {
+        let docs = [
+            json!({"title": "a", "content": "traefik notes", "tags": ["k3s"]}),
+            json!({"title": "b", "content": "traefik notes", "tags": ["traefik"]}),
+        ];
+        // Same text, but doc 1 also matches tags.keyword exactly.
+        assert_eq!(rank(&docs, "traefik"), vec![1, 0]);
+        // keyword fields are case-sensitive: `Traefik` still hits the text
+        // fields (lower-cased) but loses the exact tags.keyword bonus.
+        let analyzed: Vec<AnalyzedDoc> = docs.iter().map(AnalyzedDoc::from_source).collect();
+        let corpus = Corpus::new(analyzed.iter().collect());
+        let score_of_doc1 = |q| {
+            corpus
+                .score_all(&Query::parse(q))
+                .into_iter()
+                .find(|(i, _)| *i == 1)
+                .map(|(_, s)| s)
+                .unwrap()
+        };
+        assert!(score_of_doc1("Traefik") < score_of_doc1("traefik"));
+    }
+
+    #[test]
+    fn numbers_and_booleans_match_exactly_and_dates_are_skipped() {
+        let docs = [
+            json!({"n": 42, "ok": true, "created_at": "2026-10-30T14:00:00+09:00"}),
+            json!({"n": 7, "ok": false, "created_at": "2026-10-29"}),
+        ];
+        assert_eq!(rank(&docs, "42"), vec![0]);
+        assert_eq!(rank(&docs, "false"), vec![1]);
+        assert!(rank(&docs, "2026").is_empty());
+        assert!(rank(&docs, "30").is_empty());
+    }
+
+    #[test]
+    fn keyword_prefix_and_phrase_match_whole_values() {
+        let docs = [
+            json!({"tags": ["scale-to-zero"]}),
+            json!({"tags": ["zero"]}),
+        ];
+        // `scale-to-zero` is three text terms in both fields, plus an exact
+        // tags.keyword hit only in doc 0.
+        assert_eq!(rank(&docs, "scale-to-zero"), vec![0, 1]);
+        assert_eq!(rank(&docs, r#""scale to zero""#), vec![0]);
+        // Prefix applies to the last term: `scale` + `to*`, neither in doc 1.
+        assert_eq!(rank(&docs, "scale-to*"), vec![0]);
     }
 }
