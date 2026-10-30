@@ -1,0 +1,63 @@
+# 문서는 데이터 볼륨에 문서당 JSON 파일로 저장된다(<DATA_DIR>/indices/<index>/<id>.json).
+# 쓰기 프로세스는 하나여야 하므로 롤아웃은 Recreate 로 겹치지 않게 한다. 운영에서는 replicas 를
+# Sablier 가 0/1 로만 조절한다(flux-cd-apps cluster/docstore.yaml 의 patch 가 replicas 를 지운다).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docstore
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {}
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: docstore
+          # 태그의 단일 출처. main push 마다 CI 의 `pin` job 이 deploy 브랜치에서 이 자리를
+          # 커밋 SHA 로 고친다 — main 에 남는 값(`bootstrap` 포함)은 운영과 무관하다.
+          # 태그가 불변이므로 imagePullPolicy 는 기본값(IfNotPresent)이 옳다.
+          image: ghcr.io/dlddu/docstore:bootstrap
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: LISTEN_ADDR
+              value: 0.0.0.0:9200
+          ports:
+            - name: http
+              containerPort: 9200
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      # emptyDir 는 seam 이다: overlays/prod 는 efs PVC, overlays/e2e 는 kind 의 local-path PVC
+      # 로 바꾼다. 인덱스 0 을 두 overlay 의 patch 가 잡고 있으니 볼륨 순서를 바꾸면 함께 고칠 것.
+      volumes:
+        - name: data
+          emptyDir: {}

@@ -1,0 +1,23 @@
+# 클러스터에는 기본 StorageClass 가 없다(k3s --disable=local-storage). efs 가 유일한 클래스다.
+# EFS 는 attach 단계가 없어 RWO 가 실질적 배타성을 주지 못하고, Sablier 로 0→1 스케일될 때
+# 다른 노드에서 다시 붙어야 하므로 RWX 로 둔다.
+#
+# 주의: efs 클래스는 액세스 포인트를 PVC *이름*만으로 재사용한다(네임스페이스 무관).
+# 이 이름이 곧 데이터 위치다 — flux-cd-apps 가 관리하던 시절의 `docstore-data` 를 그대로
+# 이어받는다. 이름을 바꾸면 빈 디렉터리로 새로 시작한다.
+#
+# prune 비활성: Flux 가 실수로(경로 변경·Kustomization 정리 등) 이 PVC 를 지우지 않게 한다.
+# 정말 지우려면 이 주석을 빼고 머지한 뒤 직접 삭제한다.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: docstore-data
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  storageClassName: efs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi

@@ -1,0 +1,110 @@
+# pr.yml 에서만 호출된다(단독 트리거 없음). 트리거와 단일 필수 체크(`pr-gate`)는 pr.yml 에 있다.
+#
+# `sha` 는 PR head SHA 다. image.yml 이 이미 이 태그로 이미지를 발행했고, e2e 는 그것을
+# pull 해 kind 에 올린다 — 여기서 다시 빌드하지 않는다.
+name: Test
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: 테스트할 커밋이자 이미지 태그(PR head SHA)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # ── unit ─────────────────────────────────────────────────────────────────
+  # job 을 더 쪼개도 pr.yml 은 고칠 필요가 없다 — 이 파일의 job 이 모두 성공해야
+  # `test` 가 success 가 된다.
+  unit:
+    name: fmt + clippy + test
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  # ── kind e2e ─────────────────────────────────────────────────────────────
+  # 발행된 이미지로 deploy/overlays/e2e 를 올리고, homelab-k3s-mcp 가 부르는 방식대로
+  # HTTP 시나리오(scripts/smoke.sh)를 돈다 — 중간에 파드를 재시작해 데이터 볼륨에 문서가
+  # 남는지까지 본다.
+  e2e:
+    name: e2e (kind)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      SHA: ${{ inputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: e2e
+
+      # 노드가 ghcr 에서 직접 pull 하지 않는다: 러너가 받아서 `kind load` 한다. 그래야 노드에
+      # 레지스트리 자격증명을 줄 필요가 없고, 비공개 패키지도 같은 경로로 동작한다.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull published images and load into kind
+        run: |
+          set -euo pipefail
+          docker pull "ghcr.io/dlddu/docstore:${SHA}"
+          kind load docker-image "ghcr.io/dlddu/docstore:${SHA}" --name e2e
+
+      # 이름은 그대로 두고 태그만 PR head SHA 로 바꾼다(overlay 파일 끝에 덧붙임 — 러너의
+      # 일회성 체크아웃이라 커밋되지 않는다).
+      - name: Point the e2e overlay at this PR's images
+        run: |
+          cat >> deploy/overlays/e2e/kustomization.yaml <<EOF
+          images:
+            - name: ghcr.io/dlddu/docstore
+              newTag: "${SHA}"
+          EOF
+          kubectl kustomize deploy/overlays/e2e | grep -E 'image:'
+
+      - name: Deploy
+        run: |
+          kubectl apply -k deploy/overlays/e2e
+          kubectl rollout status deploy/docstore --timeout=180s
+
+      # port-forward 는 붙은 파드가 죽으면 끝나므로 루프로 다시 붙인다(smoke.sh 가 중간에 재시작한다).
+      - name: Smoke — HTTP scenario with a restart
+        env:
+          BASE: http://127.0.0.1:18080
+          RESTART: kubectl rollout restart deploy/docstore && kubectl rollout status deploy/docstore --timeout=180s
+          LOGS: kubectl logs deploy/docstore --tail=100
+        run: |
+          set -euo pipefail
+          ( while true; do kubectl port-forward svc/docstore 18080:80 >>/tmp/pf.log 2>&1; sleep 1; done ) &
+          pf=$!
+          trap 'kill "$pf" 2>/dev/null || true; pkill -f "kubectl port-forward" || true' EXIT
+          ./scripts/smoke.sh
+
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get all,pvc -o wide || true
+          kubectl describe deploy/docstore || true
+          kubectl logs deploy/docstore --tail=200 || true
+          kubectl get events --sort-by=.lastTimestamp | tail -50 || true

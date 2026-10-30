@@ -1,0 +1,67 @@
+# PR 체크의 단일 진입점. 브랜치 보호(main ruleset)는 체크 하나만 요구한다: `pr-gate`.
+#
+#   image -> image.yml  PR head SHA 로 이미지 발행 (pin 은 main push 에서만)
+#   test  -> test.yml   발행된 그 이미지로 테스트 (unit 자리 + kind e2e)
+#
+# 순서가 image → test 인 이유: kind e2e 가 레지스트리에 올라간 *바로 그 이미지*를 pull 해
+# 쓰므로, 테스트한 것과 배포되는 것이 같은 바이트다.
+#
+# PR 에서만 돈다. main push 에서는 테스트를 다시 돌리지 않는다 — main 에 들어오는 커밋은
+# 이미 PR 에서 `pr-gate` 를 통과했다. main 에서는 image.yml 이 자기 push 트리거로 단독 실행돼
+# 발행 + pin 만 한다.
+#
+# 체크 추가: job 을 만들고(또는 workflow_call 파일을 불러) `pr-gate.needs` 에 넣는다.
+# 브랜치 보호 설정은 건드리지 않는다.
+name: PR
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# PR 에 새 push 가 오면 이전 실행을 취소한다.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    # GitHub 는 실행 전에 호출되는 워크플로의 *모든* job 권한을 검증한다. pin job 은 PR 에서
+    # 조건상 skip 되지만 contents: write 를 선언하므로, 호출하는 쪽 상한도 그만큼 열어야 한다.
+    # image.yml 은 자기 기본값을 contents: read 로 다시 좁힌다.
+    permissions:
+      contents: write
+      packages: write
+
+  test:
+    needs: [image]
+    uses: ./.github/workflows/test.yml
+    with:
+      sha: ${{ github.event.pull_request.head.sha }}
+    permissions:
+      contents: read
+      packages: read
+
+  # 브랜치 보호의 required status check 로 거는 **유일한** 이름이다.
+  #
+  # `if: always()` 는 빼면 안 된다: 선행 job 이 실패하면 이 job 은 기본적으로 skipped 가 되고,
+  # GitHub 는 skipped 인 required check 를 통과로 친다 — 게이트가 가장 필요한 순간에 열린다.
+  # 그래서 항상 돌리고, needs 결과가 전부 success 가 아니면(failure·cancelled·skipped) 실패한다.
+  pr-gate:
+    name: pr-gate
+    if: always()
+    needs: [image, test]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 2
+    steps:
+      - name: Require every upstream job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if ! echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' > /dev/null; then
+            echo "::error::성공하지 않은 선행 job 이 있다 — 위 목록 참조"
+            exit 1
+          fi

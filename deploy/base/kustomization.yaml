@@ -1,0 +1,21 @@
+# 운영 base. 환경 중립 기본값만 둔다. 이 base 를 소비하는 곳이 둘이다:
+#   1) 운영  overlays/prod — flux-cd-apps/cluster/docstore.yaml 이 `deploy` 브랜치에서 적용.
+#            deploy = main@SHA + 「이미지를 그 SHA 로 고정」 커밋 하나(CI 의 `pin`).
+#   2) e2e   overlays/e2e — CI(test.yml)가 PR 에서 발행된 이미지를 kind 에 올려 적용.
+# (PR 프리뷰는 두지 않는다 — docstore 는 인증이 없어 클러스터 안에서만 받는다.)
+#
+# `images:` 변환을 여기(와 어떤 overlay 에도) 두지 않는다. 태그의 단일 출처는
+# deployment.yaml 의 image 줄이고(= pin 이 쓰는 자리), e2e 는 CI 가 실행 시점에 이름으로
+# retag 한다. 같은 이미지에 대한 변환이 두 곳에 있으면 서로 겹친다.
+#
+# 셀렉터 라벨은 `app: docstore` 다. 이 구조로 옮기기 전부터 운영 Deployment 의 셀렉터가
+# 이 값이었고 셀렉터는 바꿀 수 없으므로(immutable) 그대로 잇는다.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+labels:
+  - includeSelectors: true
+    pairs:
+      app: docstore
