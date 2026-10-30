@@ -97,5 +97,28 @@ cargo clippy --all-targets -- -D warnings
 python3 tests/compat/compat.py <opensearch-url> <docstore-url>
 ```
 
-CI runs fmt, clippy, unit/HTTP tests, the container smoke test and the
-OpenSearch compatibility check on every push and PR; pushes to `main` publish `ghcr.io/dlddu/docstore:<sha>` (arm64).
+## CI and deployment
+
+Pull requests have one required check, `pr-gate` (`.github/workflows/pr.yml`).
+It first publishes `ghcr.io/dlddu/docstore:<head sha>` (arm64, `image.yml`), then
+runs `test.yml` against that exact image:
+
+- `fmt + clippy + test`
+- `OpenSearch compatibility` — `tests/compat/compat.py` against a real OpenSearch
+- `e2e (kind)` — deploys `deploy/overlays/e2e` with the published image and runs
+  `scripts/smoke.sh` over HTTP, including a pod restart on a persistent volume
+
+Tests do not run again on `main`. A push to `main` publishes
+`ghcr.io/dlddu/docstore:<sha>` and force-pushes the `deploy` branch: that commit
+plus one commit pinning the image in `deploy/` to `<sha>` (trailer
+`Source-Commit: <sha>`). Production follows `deploy`: Flux in
+[dlddu/flux-cd-apps](https://github.com/dlddu/flux-cd-apps) applies
+`deploy/overlays/prod` from it (`cluster/docstore.yaml`, which also adds the
+Sablier scale-to-zero labels). The IngressRoute, Sablier middleware and VPA live
+in that repo under `apps/docstore`.
+
+- Image tags are commit SHAs only; there is no `latest`. The `image:` line on
+  `main` is a placeholder and does not affect production.
+- Roll back by merging a revert PR into `main`; that publishes and pins a new SHA.
+- To see what production runs, read the `Source-Commit` trailer of the tip of
+  `deploy`.
