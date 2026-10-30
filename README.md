@@ -32,10 +32,20 @@ Index names follow OpenSearch rules (lowercase, no `\/*?"<>| ,#:`, no leading
 `simple_query_string` subset: words are OR-ed, `+word` must match, `-word`
 must not, `"a phrase"` must appear adjacently within one value, `word*` is a
 prefix query and a lone `*` matches everything (score 1). `|`, `(`, `)` and
-`~N` are accepted and ignored. Text is analyzed like OpenSearch's `standard`
-analyzer (alphanumeric runs in any script, lower-cased). Results are ranked
-with BM25 over all values of the document. Non-ASCII words additionally match
-longer words they prefix at half weight, so `배포` finds `배포를`.
+`~N` are accepted and ignored.
+
+Documents are indexed the way OpenSearch's default dynamic mapping would:
+every string is a `text` field (analyzed like the `standard` analyzer:
+alphanumeric runs in any script, lower-cased) and, up to 256 characters, also
+a `<path>.keyword` field holding the exact value; numbers and booleans are
+exact-value fields; date-looking strings (`2026-10-30`,
+`2026-10-30T14:00:00+09:00`, `2026/10/30`) are skipped, as date detection
+would map them to `date` fields. Ranking is per-field BM25 summed over fields
+(`most_fields`, Lucene's formula, k1 1.2, b 0.75), so a hit in a short, rare
+field such as a title or a tag outweighs the same word deep in a long body.
+Exact-value fields match a query word equal to a whole value (case-sensitive)
+and carry no length normalization. Non-ASCII words additionally match longer
+words they prefix at half weight, so `배포` finds `배포를`.
 
 Writes are visible to the next search immediately (no refresh interval).
 
@@ -43,22 +53,24 @@ Writes are visible to the next search immediately (no refresh interval).
 
 `tests/compat/compat.py` sends the same requests to a real OpenSearch 2.x
 (security plugin off) and to docstore, and CI fails if statuses, write
-results, matched document sets, totals or `_source` round trips differ. So a
+results, matched document sets, totals or `_source` round trips differ, or if
+the top hit differs on corpora built so that per-field scoring decides it. So a
 client of this API can be pointed back at OpenSearch, and data moves either
 way with `match_all` + `from/size` reads and `_doc` PUTs.
 
 Known differences (not compared):
 
-- **Ranking and scores.** Both rank with BM25, but OpenSearch scores per
-  field, so a match in a short field such as a title ranks higher there.
+- **Exact scores.** Ranking uses the same per-field BM25, but scores are not
+  bit-identical (Lucene quantizes field lengths; numeric and boolean matches
+  score a constant there).
 - **`-word` alone.** With the default `OR` operator, OpenSearch treats
   `a -b` as "a, or anything without b"; docstore requires a positive match.
 - **Non-ASCII prefixes.** docstore also matches longer non-ASCII words a
   query word prefixes (`배포` → `배포를`); OpenSearch's standard analyzer
   does not.
-- **Dates and numbers.** OpenSearch's dynamic mapping turns date-looking
-  strings and numbers into `date`/`long` fields that full-text queries
-  mostly skip; docstore indexes every scalar as text.
+- **Mapping is per value, not per index.** OpenSearch fixes a field's type
+  from the first document that has it; docstore decides per value (a date
+  string in a field that is otherwise text is still skipped).
 - **Refresh.** OpenSearch needs a refresh (about 1 s) before a write is
   searchable; docstore does not.
 - **Errors.** A delete in a missing index is `404` on both, but OpenSearch
@@ -77,6 +89,12 @@ never leaves a torn document. All documents are loaded into memory at start-up
 owns its directory and does not coordinate with other writers.
 
 Backups are plain files: `tar` the data directory.
+
+To move documents between docstore and OpenSearch in either direction (each
+side optionally basic or SigV4 `es`/`aoss` authenticated), use
+`scripts/copy_documents.py`; it copies every document with its index and id
+and reads each one back to verify. It is stdlib-only, so it runs as a bare
+`python:3.12-slim` Job.
 
 ## Configuration
 

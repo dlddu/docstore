@@ -3,9 +3,9 @@
 
 Sends the same requests to both servers and compares what an OpenSearch client
 would rely on: status codes, write results, matched document sets, totals and
-`_source` round trips. Scores and ranking are not compared (docstore's BM25 is
-not OpenSearch's), nor is anything listed under "Known differences" in the
-README.
+`_source` round trips, plus the top hit for a few corpora built so that
+per-field scoring decides it. Raw scores are not compared, nor is anything
+listed under "Known differences" in the README.
 
 Usage: compat.py <opensearch-url> <docstore-url>
 Stdlib only. Exits 1 on any mismatch.
@@ -108,7 +108,39 @@ DOCS = {
     "c3": {"title": "Scale to zero", "body": "sablier scale-to-zero with traefik", "ok": True},
     "c4": {"title": "한국어 문서", "body": "배포 완료 그리고 점검", "nested": {"deep": "hidden needle"}},
     "c5": {"title": "versions", "body": "release v1.16.1 and k3s_snake_case"},
+    "c6": {"title": "dated", "when": "2026-10-30T14:00:00+09:00"},
 }
+
+FILLER = "lorem ipsum dolor sit amet consectetur " * 30
+# Each corpus is built so that per-field BM25 alone decides the top hit.
+RANK_CASES = {
+    "compat-rank-title": (
+        "sablier",
+        "r-title",
+        {
+            "r-body": {"title": "storage notes", "content": f"{FILLER} sablier {FILLER}"},
+            "r-title": {"title": "sablier setup", "content": FILLER},
+            "r-none": {"title": "other", "content": FILLER},
+        },
+    ),
+    "compat-rank-tag": (
+        "traefik",
+        "t-tag",
+        {
+            "t-text": {"title": "x", "content": f"traefik notes {FILLER}", "tags": ["k3s"]},
+            "t-tag": {"title": "y", "content": f"traefik notes {FILLER}", "tags": ["traefik"]},
+        },
+    ),
+}
+
+
+def same_top(name, query, index, expected):
+    req = {"size": 3, "query": {"simple_query_string": {"query": query}}}
+    (s1, b1), (s2, b2) = both("POST", f"/{index}/_search", req)
+    top1 = b1["hits"]["hits"][0]["_id"] if s1 == 200 and b1["hits"]["hits"] else None
+    top2 = b2["hits"]["hits"][0]["_id"] if s2 == 200 and b2["hits"]["hits"] else None
+    check(name + " [top hit]", top1 == top2 == expected,
+          f"expected {expected}: opensearch {top1} / docstore {top2}")
 
 
 def main() -> None:
@@ -116,6 +148,9 @@ def main() -> None:
     for doc_id, doc in DOCS.items():
         write(f"put {doc_id}", "PUT", f"/{idx}/_doc/{doc_id}", doc)
     write("re-put c5 (upsert)", "PUT", f"/{idx}/_doc/c5", {**DOCS["c5"], "extra": "upsertneedle"})
+    for index, (_, _, docs) in RANK_CASES.items():
+        for doc_id, doc in docs.items():
+            write(f"put {index}/{doc_id}", "PUT", f"/{index}/_doc/{doc_id}", doc)
     write("post auto id", "POST", f"/{other}/_doc", {"title": "auto generated alpha"}, expect_id=False)
     write("put id with reserved chars", "PUT", f"/{other}/_doc/a%2Fb%20c", {"title": "slash space alpha"})
     refresh()
@@ -141,6 +176,9 @@ def main() -> None:
     search("underscore token", "k3s_snake_case", idx)
     search("version token", "v1.16.1", idx)
     search("upserted content", "upsertneedle", idx)
+    search("number value", "42", idx)
+    search("text next to a date field", "dated", idx)
+    search("token only inside a date value", "14", idx)
     search("match all", "*", idx)
     search("no match", "zzznomatch", idx)
     search("all indices", "alpha")
@@ -149,6 +187,9 @@ def main() -> None:
     search("size limits hits", "alpha", idx, size=1)
     same_error("search missing index", "POST", "/compat-missing/_search", {"query": {"match_all": {}}})
     search("wildcard matching nothing", "alpha", "nothing-here-*")
+
+    for index, (query, expected, _) in RANK_CASES.items():
+        same_top(f"ranking {index}", query, index, expected)
 
     (s1, b1), (s2, b2) = both("GET", f"/{idx}/_count")
     check("count", s1 == s2 == 200 and b1["count"] == b2["count"], f"{b1} / {b2}")
