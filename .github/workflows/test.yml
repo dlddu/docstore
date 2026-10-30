@@ -90,7 +90,8 @@ jobs:
 
       # smoke.sh 가 중간에 파드를 재시작한다. port-forward 는 시작할 때 고른 파드에 묶이고, 그 파드가
       # 죽어도 프로세스가 끝나지 않고 죽은 파드를 붙든 채 남는다. 그래서 RESTART 가 롤아웃 뒤에
-      # port-forward 를 죽이고, 바깥 루프가 새 파드로 다시 붙인다.
+      # port-forward 를 죽이고, 바깥 루프가 새 파드로 다시 붙인다(`|| true` 가 없으면 set -e 가
+      # 상속된 루프 서브셸이 죽은 kubectl 의 종료 코드로 함께 끝난다).
       - name: Smoke — HTTP scenario with a restart
         env:
           BASE: http://127.0.0.1:18080
@@ -101,7 +102,7 @@ jobs:
           LOGS: kubectl logs deploy/docstore --tail=100
         run: |
           set -euo pipefail
-          ( while true; do kubectl port-forward svc/docstore 18080:80 >>/tmp/pf.log 2>&1; sleep 1; done ) &
+          ( while true; do kubectl port-forward svc/docstore 18080:80 >>/tmp/pf.log 2>&1 || true; sleep 1; done ) &
           pf=$!
           trap 'kill "$pf" 2>/dev/null || true; pkill -f "kubectl port-forward" || true' EXIT
           ./scripts/smoke.sh
