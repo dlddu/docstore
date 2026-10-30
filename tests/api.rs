@@ -305,3 +305,17 @@ async fn health_endpoints() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(b["name"], "docstore");
 }
+
+#[tokio::test]
+async fn refresh_is_an_accepted_no_op() {
+    let h = Harness::new();
+    h.call(Method::PUT, "/r/_doc/1", Some(json!({"a": "x"})))
+        .await;
+    let (s, b) = h.call(Method::POST, "/r/_refresh", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["_shards"]["failed"], 0);
+    let (s, _) = h.call(Method::POST, "/_refresh", None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = h.call(Method::POST, "/missing/_refresh", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}

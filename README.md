@@ -20,6 +20,7 @@ bulk API, or query DSL beyond `simple_query_string` / `match_all`.
 | `DELETE` | `/{index}/_doc/{id}` | `200 {"result":"deleted"}` or `404 {"result":"not_found"}` (also for a missing index) |
 | `GET` | `/_count`, `/{index}/_count` | `{"count": n}` |
 | `GET` | `/_cat/indices` | `[{"index", "docs.count"}]` |
+| `POST`/`GET` | `/_refresh`, `/{index}/_refresh` | No-op (writes are already visible); accepted so OpenSearch clients run unchanged |
 | `GET` | `/healthz`, `/` | Liveness / version |
 
 Errors use the OpenSearch shape `{"error": {"type", "reason"}, "status"}`.
@@ -37,6 +38,32 @@ with BM25 over all values of the document. Non-ASCII words additionally match
 longer words they prefix at half weight, so `배포` finds `배포를`.
 
 Writes are visible to the next search immediately (no refresh interval).
+
+### Compatibility with OpenSearch
+
+`tests/compat/compat.py` sends the same requests to a real OpenSearch 2.x
+(security plugin off) and to docstore, and CI fails if statuses, write
+results, matched document sets, totals or `_source` round trips differ. So a
+client of this API can be pointed back at OpenSearch, and data moves either
+way with `match_all` + `from/size` reads and `_doc` PUTs.
+
+Known differences (not compared):
+
+- **Ranking and scores.** Both rank with BM25, but OpenSearch scores per
+  field, so a match in a short field such as a title ranks higher there.
+- **`-word` alone.** With the default `OR` operator, OpenSearch treats
+  `a -b` as "a, or anything without b"; docstore requires a positive match.
+- **Non-ASCII prefixes.** docstore also matches longer non-ASCII words a
+  query word prefixes (`배포` → `배포를`); OpenSearch's standard analyzer
+  does not.
+- **Dates and numbers.** OpenSearch's dynamic mapping turns date-looking
+  strings and numbers into `date`/`long` fields that full-text queries
+  mostly skip; docstore indexes every scalar as text.
+- **Refresh.** OpenSearch needs a refresh (about 1 s) before a write is
+  searchable; docstore does not.
+- **Errors.** A delete in a missing index is `404` on both, but OpenSearch
+  answers with an `index_not_found_exception` body rather than
+  `{"result": "not_found"}`.
 
 ## Storage
 
@@ -67,7 +94,8 @@ There is no authentication; expose it only inside the cluster.
 cargo test
 cargo clippy --all-targets -- -D warnings
 ./scripts/smoke.sh <image>   # container test with a volume and a restart
+python3 tests/compat/compat.py <opensearch-url> <docstore-url>
 ```
 
-CI runs fmt, clippy, unit/HTTP tests and the container smoke test on every
-push and PR; pushes to `main` publish `ghcr.io/dlddu/docstore:<sha>` (arm64).
+CI runs fmt, clippy, unit/HTTP tests, the container smoke test and the
+OpenSearch compatibility check on every push and PR; pushes to `main` publish `ghcr.io/dlddu/docstore:<sha>` (arm64).
