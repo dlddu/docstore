@@ -33,8 +33,10 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/_search", get(search_all).post(search_all))
         .route("/_count", get(count_all).post(count_all))
         .route("/_cat/indices", get(cat_indices))
+        .route("/_refresh", get(refresh_all).post(refresh_all))
         .route("/{index}/_search", get(search_index).post(search_index))
         .route("/{index}/_count", get(count_index).post(count_index))
+        .route("/{index}/_refresh", get(refresh_index).post(refresh_index))
         .route("/{index}/_doc", post(create_doc))
         .route(
             "/{index}/_doc/{id}",
@@ -199,6 +201,28 @@ async fn count_index(
     Path(index): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     count(&store, Some(&index))
+}
+
+// --------------------------------------------------------------- refresh
+
+// Writes are searchable immediately, so refresh is a no-op. It exists so that
+// clients written for OpenSearch (which must refresh before reading their own
+// writes) run unchanged against docstore.
+async fn refresh_all(State(store): State<AppState>) -> Result<Json<Value>, ApiError> {
+    refresh(&store, None)
+}
+
+async fn refresh_index(
+    State(store): State<AppState>,
+    Path(index): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    refresh(&store, Some(&index))
+}
+
+fn refresh(store: &Store, index: Option<&str>) -> Result<Json<Value>, ApiError> {
+    store.with_indices(index, |_| {
+        Json(json!({"_shards": {"total": 1, "successful": 1, "failed": 0}}))
+    })
 }
 
 fn count(store: &Store, index: Option<&str>) -> Result<Json<Value>, ApiError> {

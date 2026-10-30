@@ -43,9 +43,46 @@ jobs:
           cache-to: type=gha,mode=max,scope=docstore
       - run: ./scripts/smoke.sh docstore:ci
 
+  # Same requests against a real OpenSearch and docstore; fails when docstore
+  # drifts out of the OpenSearch subset it claims (statuses, write results,
+  # matched document sets, totals, _source round trips). Keeps a later move
+  # back to OpenSearch a configuration change.
+  compat:
+    name: OpenSearch compatibility
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start OpenSearch
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          docker run -d --name opensearch -p 9201:9200 \
+            -e discovery.type=single-node \
+            -e DISABLE_SECURITY_PLUGIN=true \
+            -e DISABLE_INSTALL_DEMO_CONFIG=true \
+            -e OPENSEARCH_JAVA_OPTS="-Xms512m -Xmx512m" \
+            opensearchproject/opensearch:2
+      - run: cargo build --release --locked
+      - name: Start docstore
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          DATA_DIR="$RUNNER_TEMP/data" LISTEN_ADDR=127.0.0.1:9202 ./target/release/docstore > "$RUNNER_TEMP/docstore.log" 2>&1 &
+      - name: Wait for both
+        run: |
+          for i in $(seq 1 90); do
+            curl -fsS 'http://127.0.0.1:9201/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null 2>&1 \
+              && curl -fsS http://127.0.0.1:9202/healthz >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs opensearch | tail -50; cat "$RUNNER_TEMP/docstore.log"; exit 1
+      - run: python3 tests/compat/compat.py http://127.0.0.1:9201 http://127.0.0.1:9202
+      - if: failure()
+        run: docker logs opensearch | tail -100; cat "$RUNNER_TEMP/docstore.log"
+
   image:
     name: build & push image
-    needs: [test, smoke]
+    needs: [test, smoke, compat]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     permissions:
