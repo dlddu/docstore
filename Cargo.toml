@@ -1,0 +1,30 @@
+[package]
+name = "docstore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A tiny OpenSearch-REST-subset document store that keeps JSON documents as files (EFS-friendly)."
+license = "MIT"
+publish = false
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+rand = "0.8"
+sha2 = "0.10"
+percent-encoding = "2"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
