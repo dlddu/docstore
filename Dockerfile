@@ -14,6 +14,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 FROM gcr.io/distroless/cc-debian12:nonroot
 ENV DATA_DIR=/data LISTEN_ADDR=0.0.0.0:9200
 EXPOSE 9200
-USER nonroot:nonroot
+# Numeric so Kubernetes runAsNonRoot can verify it (distroless "nonroot").
+USER 65532:65532
 COPY --from=builder /app/target/release/docstore /usr/local/bin/docstore
 ENTRYPOINT ["/usr/local/bin/docstore"]
