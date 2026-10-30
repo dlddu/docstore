@@ -88,11 +88,16 @@ jobs:
           kubectl apply -k deploy/overlays/e2e
           kubectl rollout status deploy/docstore --timeout=180s
 
-      # port-forward 는 붙은 파드가 죽으면 끝나므로 루프로 다시 붙인다(smoke.sh 가 중간에 재시작한다).
+      # smoke.sh 가 중간에 파드를 재시작한다. port-forward 는 시작할 때 고른 파드에 묶이고, 그 파드가
+      # 죽어도 프로세스가 끝나지 않고 죽은 파드를 붙든 채 남는다. 그래서 RESTART 가 롤아웃 뒤에
+      # port-forward 를 죽이고, 바깥 루프가 새 파드로 다시 붙인다.
       - name: Smoke — HTTP scenario with a restart
         env:
           BASE: http://127.0.0.1:18080
-          RESTART: kubectl rollout restart deploy/docstore && kubectl rollout status deploy/docstore --timeout=180s
+          RESTART: >-
+            kubectl rollout restart deploy/docstore &&
+            kubectl rollout status deploy/docstore --timeout=180s &&
+            { pkill -f "kubectl [p]ort-forward svc/docstore" || true; }
           LOGS: kubectl logs deploy/docstore --tail=100
         run: |
           set -euo pipefail
@@ -108,3 +113,4 @@ jobs:
           kubectl describe deploy/docstore || true
           kubectl logs deploy/docstore --tail=200 || true
           kubectl get events --sort-by=.lastTimestamp | tail -50 || true
+          cat /tmp/pf.log || true
