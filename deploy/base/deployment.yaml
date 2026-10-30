@@ -22,7 +22,7 @@ spec:
           # 태그의 단일 출처. main push 마다 CI 의 `pin` job 이 deploy 브랜치에서 이 자리를
           # 커밋 SHA 로 고친다 — main 에 남는 값(`bootstrap` 포함)은 운영과 무관하다.
           # 태그가 불변이므로 imagePullPolicy 는 기본값(IfNotPresent)이 옳다.
-          image: ghcr.io/dlddu/docstore:bootstrap
+          image: ghcr.io/dlddu/docstore:ac2258e81f8fb24eafa6f9c2caf12ba3bff437b6
           env:
             - name: DATA_DIR
               value: /data
